@@ -1,32 +1,38 @@
 # Music Complex for Windows
 
-Windows desktop Plex music player built with Electron, React, and Vite.
+Music Complex is a Windows desktop music player for Plex libraries. It is built with Electron, React, and Vite, and focuses on fast library browsing, reliable queue control, local playback, and Chromecast playback from a dedicated desktop app.
 
 ## Features
 
-- Plex music library browsing
-- Artist, album, playlist, and track selection
-- Queue management
-- Local playback
-- Chromecast discovery and playback
+- Sign in with Plex or connect directly to a Plex server
+- Browse artists, albums, playlists, and tracks
+- Search the current library view
+- Play music locally on this computer
+- Cast playback to Chromecast devices on the local network
+- Manage the queue, including adding, removing, and reordering tracks
+- Shuffle and repeat playback
+- Match volume between tracks
 - Light and dark themes
-- Windows installer and portable builds
+- Windows installer and portable executable builds
 
-## Run Locally
+## Development
 
 ```powershell
 npm install
 npm run dev
 ```
 
-## Build
+## Test
+
+```powershell
+npm test -- --run
+npm audit
+```
+
+## Build Installer
 
 ```powershell
 npm run dist
 ```
 
 Build output is written to `release/`.
-
-## Notes
-
-This repo intentionally excludes the Android native project. The Android app lives in the separate `Music-Complex-Android` repo.
