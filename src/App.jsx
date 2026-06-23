@@ -35,11 +35,6 @@ import {
   yearFrom,
 } from './plex';
 import {
-  attachPlayableUrlsToCatalog,
-  buildAndroidAutoCatalog,
-  chooseAutoPlaybackTarget,
-} from './androidAutoCatalog';
-import {
   buildPlaybackQueue,
   buildSelectedCollectionQueue,
   inferCastFinished,
@@ -50,11 +45,8 @@ import {
   toggleShuffleState,
   trackIdentity,
 } from './playbackLogic';
-import { installMobileBridge } from './mobileBridge';
 import logoMark from './music-complex-logo.png';
 import './styles.css';
-
-installMobileBridge();
 
 const STORAGE_KEY = 'moonbounce.settings';
 const ALBUM_CACHE_LIMIT = 30;
@@ -105,10 +97,7 @@ function App() {
   const [artists, setArtists] = useState([]);
   const [playlists, setPlaylists] = useState([]);
   const [albums, setAlbums] = useState([]);
-  const [autoLibraryAlbums, setAutoLibraryAlbums] = useState([]);
   const [tracks, setTracks] = useState([]);
-  const [autoLibraryTracks, setAutoLibraryTracks] = useState([]);
-  const [autoPlaylistTracksById, setAutoPlaylistTracksById] = useState({});
   const [queue, setQueue] = useState([]);
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [browseMode, setBrowseMode] = useState('artists');
@@ -158,8 +147,6 @@ function App() {
   const castVolumeTimerRef = useRef(null);
   const castVolumeOverlayTimerRef = useRef(null);
   const systemVolumeTimerRef = useRef(null);
-  const autoTransportRef = useRef(null);
-  const autoLastMediaCommandRef = useRef({ mediaId: '', time: 0 });
   const trackListRef = useRef(null);
   const mobileTouchStartRef = useRef(null);
   const queueRef = useRef([]);
@@ -225,7 +212,6 @@ function App() {
     setSettings(nextSettings);
     writeSettings(nextSettings);
     setAudioLevelingEnabled(enabled);
-    window.moonbounce?.nativePlayer?.matchVolume?.(enabled).catch(() => {});
   }
 
   function ensureAudioLeveling() {
@@ -281,34 +267,8 @@ function App() {
     return Number.isFinite(progressRef.current) ? progressRef.current : 0;
   }
 
-  function nativePlayerAvailable() {
-    return Boolean(window.moonbounce?.nativePlayer?.supported);
-  }
-
-  function nativeTrackPayload(track) {
-    return {
-      url: playableUrl(track),
-      title: track?.title || '',
-      artist: track?.grandparentTitle || track?.parentTitle || '',
-      album: track?.parentTitle || '',
-      coverUrl: coverUrl(track),
-      duration: Number(track?.duration || 0),
-      matchVolume,
-    };
-  }
-
-  async function stopNativePlayback() {
-    if (!nativePlayerAvailable()) return;
-    try {
-      await window.moonbounce.nativePlayer.stop();
-    } catch (error) {
-      logEvent('native:stop:error', { message: error.message });
-    }
-  }
-
   function clearLoadedLibraryState() {
     audioRef.current?.pause();
-    stopNativePlayback();
     setIsPlaying(false);
     setCastPlaying(false);
     setCastLoadedTrackId('');
@@ -317,10 +277,7 @@ function App() {
     setPlaylists([]);
     resetAlbumCache();
     setAlbums([]);
-    setAutoLibraryAlbums([]);
     setTracks([]);
-    setAutoLibraryTracks([]);
-    setAutoPlaylistTracksById({});
     setQueue([]);
     orderedQueueRef.current = [];
     setCurrentIndex(-1);
@@ -334,7 +291,6 @@ function App() {
 
   function replaceQueue(nextQueue, nextIndex = -1) {
     audioRef.current?.pause();
-    stopNativePlayback();
     orderedQueueRef.current = nextQueue;
     setQueue(nextQueue);
     setCurrentIndex(nextIndex);
@@ -522,9 +478,6 @@ function App() {
     if (!plex || !settings.libraryKey) return;
     let alive = true;
     setLoading(true);
-    setAutoLibraryAlbums([]);
-    setAutoLibraryTracks([]);
-    setAutoPlaylistTracksById({});
     Promise.all([
       plex.libraries(),
       plex.artists(settings.libraryKey),
@@ -546,36 +499,6 @@ function App() {
     }).finally(() => {
       if (alive) setLoading(false);
     });
-    return () => {
-      alive = false;
-    };
-  }, [plex, settings.libraryKey]);
-
-  useEffect(() => {
-    if (!plex || !settings.libraryKey) return undefined;
-    let alive = true;
-    plex.albums(settings.libraryKey)
-      .then((nextAlbums) => {
-        if (alive) setAutoLibraryAlbums(nextAlbums);
-      })
-      .catch((error) => {
-        if (alive) logEvent('auto:catalog-album-load:error', { message: error.message });
-      });
-    return () => {
-      alive = false;
-    };
-  }, [plex, settings.libraryKey]);
-
-  useEffect(() => {
-    if (!plex || !settings.libraryKey) return undefined;
-    let alive = true;
-    plex.tracks(settings.libraryKey)
-      .then((nextTracks) => {
-        if (alive) setAutoLibraryTracks(nextTracks);
-      })
-      .catch((error) => {
-        if (alive) logEvent('auto:catalog-track-load:error', { message: error.message });
-      });
     return () => {
       alive = false;
     };
@@ -648,75 +571,6 @@ function App() {
       audio.removeEventListener('pause', onPause);
       audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('error', onError);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!window.moonbounce?.nativePlayer?.onEvent) return undefined;
-    return window.moonbounce.nativePlayer.onEvent((event = {}) => {
-      logEvent('native:event', event);
-      applyNativePlayerState(event);
-    });
-  }, []);
-
-  function applyNativePlayerState(statusResult = {}) {
-    if (typeof statusResult.index === 'number' && statusResult.index >= 0) {
-      setCurrentIndex(statusResult.index);
-    }
-    if (typeof statusResult.position === 'number') setProgress(statusResult.position);
-    if (typeof statusResult.duration === 'number' && Number.isFinite(statusResult.duration)) {
-      setDuration(statusResult.duration);
-    }
-    if (statusResult.event === 'playing' || statusResult.event === 'preparing' || statusResult.playing === true || statusResult.preparing === true) {
-      setIsPlaying(true);
-      setCastPlaying(false);
-      return;
-    }
-    if (statusResult.event === 'paused' || statusResult.event === 'stopped' || (statusResult.playing === false && statusResult.preparing === false)) {
-      setIsPlaying(false);
-      return;
-    }
-    if (statusResult.event === 'queueFinished') {
-      setIsPlaying(false);
-      setCastPlaying(false);
-      setStatus('Queue finished.');
-      return;
-    }
-    if (statusResult.event === 'error') {
-      setIsPlaying(false);
-      setStatus(statusResult.message || 'Native playback failed.');
-    }
-  }
-
-  async function syncNativePlayerState(reason = 'manual') {
-    if (!nativePlayerAvailable() || selectedCastDeviceRef.current) return;
-    try {
-      const statusResult = await window.moonbounce.nativePlayer.status();
-      logEvent('native:status:sync', { reason, ...statusResult });
-      applyNativePlayerState(statusResult);
-    } catch (error) {
-      logEvent('native:status:sync:error', { reason, message: error.message });
-    }
-  }
-
-  useEffect(() => {
-    if (!nativePlayerAvailable() || selectedCastDevice || !isPlaying) return undefined;
-    const timer = window.setInterval(async () => {
-      syncNativePlayerState('poll');
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [isPlaying, selectedCastDevice]);
-
-  useEffect(() => {
-    if (!nativePlayerAvailable()) return undefined;
-    const syncOnResume = () => {
-      if (!document.hidden) syncNativePlayerState('resume');
-    };
-    document.addEventListener('visibilitychange', syncOnResume);
-    window.addEventListener('focus', syncOnResume);
-    return () => {
-      document.removeEventListener('visibilitychange', syncOnResume);
-      window.removeEventListener('focus', syncOnResume);
     };
   }, []);
 
@@ -1243,10 +1097,6 @@ function App() {
         setSelectedPlaylist(fallback);
       }
       setTracks(nextTracks);
-      setAutoPlaylistTracksById((previous) => ({
-        ...previous,
-        [cacheKeyForPlaylist(playlist)]: nextTracks,
-      }));
       setStatus(`${playlist.title} loaded.`);
     } catch (error) {
       setStatus(error.message);
@@ -1318,7 +1168,6 @@ function App() {
       }
 
       audioRef.current?.pause();
-      stopNativePlayback();
       setIsPlaying(false);
       setCastPlaying(true);
       setCurrentIndex(index);
@@ -1369,13 +1218,6 @@ function App() {
       return;
     }
 
-    if (nativePlayerAvailable()) {
-      const activeQueue = queueRef.current.length ? queueRef.current : [track];
-      const nativeIndex = Math.max(0, Math.min(index, activeQueue.length - 1));
-      playNativeQueue(activeQueue, nativeIndex, startTime);
-      return;
-    }
-
     window.setTimeout(() => {
       const audio = audioRef.current;
       if (!audio) return;
@@ -1418,36 +1260,6 @@ function App() {
     playLocalTrack(queue[index], index);
   }
 
-  async function playNativeQueue(nextQueue, startIndex = 0, startTime = 0) {
-    const playableTracks = nextQueue.filter((track) => playableUrl(track));
-    if (!playableTracks.length) {
-      setIsPlaying(false);
-      setStatus('Connect Plex to play real audio.');
-      return;
-    }
-    const safeIndex = Math.max(0, Math.min(startIndex, playableTracks.length - 1));
-    try {
-      audioRef.current?.pause();
-      await window.moonbounce.nativePlayer.play({
-        tracks: playableTracks.map(nativeTrackPayload),
-        startIndex: safeIndex,
-        startTime,
-        volume,
-        matchVolume,
-      });
-      setCurrentIndex(safeIndex);
-      setSelectedTrack(playableTracks[safeIndex]);
-      setIsPlaying(true);
-      setCastPlaying(false);
-      setProgress(startTime || 0);
-      setDuration(playableTracks[safeIndex]?.duration ? playableTracks[safeIndex].duration / 1000 : 0);
-    } catch (error) {
-      setIsPlaying(false);
-      setStatus(error.message);
-      logEvent('native:play:error', { message: error.message });
-    }
-  }
-
   function playQueue(nextQueue, startTrack) {
     const {
       startIndex,
@@ -1477,10 +1289,6 @@ function App() {
     setTimeout(() => {
       if (selectedCastDevice) {
         playOnCast(startTrack, 0);
-        return;
-      }
-      if (nativePlayerAvailable()) {
-        playNativeQueue(playbackQueue, 0);
         return;
       }
       playLocalTrack(startTrack, 0);
@@ -1545,20 +1353,6 @@ function App() {
       setStatus('Connect Plex to play real audio.');
       return;
     }
-    if (nativePlayerAvailable()) {
-      try {
-        if (isPlaying) {
-          await window.moonbounce.nativePlayer.pause();
-          setIsPlaying(false);
-        } else {
-          await window.moonbounce.nativePlayer.resume();
-          setIsPlaying(true);
-        }
-      } catch (error) {
-        setStatus(error.message);
-      }
-      return;
-    }
     if (audio.paused) {
       audio.play().then(() => setIsPlaying(true)).catch((error) => setStatus(error.message));
     } else {
@@ -1584,10 +1378,6 @@ function App() {
     if (step.type === 'repeat-one') {
       if (selectedCastDevice && playbackTarget !== 'local') {
         await playOnCast(currentTrack, currentIndex);
-      } else if (nativePlayerAvailable()) {
-        await window.moonbounce.nativePlayer.seek(0);
-        await window.moonbounce.nativePlayer.resume();
-        setIsPlaying(true);
       } else {
         audioRef.current.currentTime = 0;
         audioRef.current.play().then(() => setIsPlaying(true)).catch((error) => setStatus(error.message));
@@ -1740,14 +1530,6 @@ function App() {
       }
       return;
     }
-    if (nativePlayerAvailable()) {
-      try {
-        await window.moonbounce.nativePlayer.seek(next);
-      } catch (error) {
-        setStatus(error.message);
-      }
-      return;
-    }
     if (audioRef.current) audioRef.current.currentTime = next;
   }
 
@@ -1755,11 +1537,6 @@ function App() {
     const next = Number(value);
     setVolume(next);
     if (audioRef.current) audioRef.current.volume = 1;
-    if (nativePlayerAvailable()) {
-      window.moonbounce.nativePlayer.volume(next).catch((error) => {
-        logEvent('native:volume:error', { message: error.message });
-      });
-    }
 
     if (selectedCastDevice && window.moonbounce?.cast) {
       if (castVolumeTimerRef.current) window.clearTimeout(castVolumeTimerRef.current);
@@ -1797,17 +1574,7 @@ function App() {
       }
 
       if (playableUrl(track)) {
-        if (nativePlayerAvailable()) {
-          playNativeQueue(queue, index);
-          return;
-        }
-        audioRef.current?.load();
-        audioRef.current?.play()
-          .then(() => setIsPlaying(true))
-          .catch((error) => {
-            setIsPlaying(false);
-            setStatus(error.message);
-          });
+        playLocalTrack(track, index);
       } else {
         setIsPlaying(false);
         setStatus('Connect Plex to play real audio.');
@@ -1916,7 +1683,6 @@ function App() {
         device: device.friendlyName || device.name,
       }));
       audioRef.current?.pause();
-      stopNativePlayback();
       setIsPlaying(false);
       setCastPlaying(false);
       setSelectedCastDevice(device);
@@ -2139,182 +1905,6 @@ function App() {
   }, [currentTrack, heroArt, visibleAlbums]);
   const heroPlayButtonShowsPause = !pendingSelectedTrack && !selectedCollection && (isPlaying || castPlaying);
   const transportPlayButtonShowsPause = isPlaying || castPlaying;
-  const autoCatalogTracks = useMemo(() => {
-    const byId = new Map();
-    [...autoLibraryTracks, ...tracks].filter(Boolean).forEach((track) => {
-      byId.set(trackIdentity(track), track);
-    });
-    return [...byId.values()];
-  }, [autoLibraryTracks, tracks]);
-
-  async function playAutoMediaId(mediaId) {
-    if (!plex) {
-      setStatus('Connect Plex on your phone before using Android Auto.');
-      return;
-    }
-    const now = Date.now();
-    const lastMediaCommand = autoLastMediaCommandRef.current;
-    if (lastMediaCommand.mediaId === mediaId && now - lastMediaCommand.time < 1200) {
-      logEvent('auto:play-media-id:dedupe', { mediaId });
-      return;
-    }
-    autoLastMediaCommandRef.current = { mediaId, time: now };
-    logEvent('auto:play-media-id', { mediaId });
-    const target = chooseAutoPlaybackTarget({
-      mediaId,
-      tracks: autoCatalogTracks,
-      artists,
-      playlists,
-      albums,
-      playlistTracksById: autoPlaylistTracksById,
-      shuffled: shuffle,
-    });
-    if (!target) {
-      setStatus('That Android Auto item is no longer available.');
-      return;
-    }
-
-    if ((target.kind === 'track' || target.kind === 'shuffle') && target.track) {
-      playQueue(target.tracks, target.track);
-      return;
-    }
-
-    if (target.kind === 'playlist' && target.item) {
-      const nextTracks = target.tracks?.length ? target.tracks : await plex.playlistTracks(target.item);
-      if (!nextTracks.length) {
-        setStatus(`${target.item.title} has no playable tracks.`);
-        return;
-      }
-      setAutoPlaylistTracksById((previous) => ({
-        ...previous,
-        [cacheKeyForPlaylist(target.item)]: nextTracks,
-      }));
-      setBrowseMode('playlists');
-      setSelectedPlaylist(target.item);
-      setSelectedArtist(null);
-      setSelectedAlbum(null);
-      setSelectedTrack(null);
-      setTracks(nextTracks);
-      playQueue(nextTracks, target.shuffled || shuffle ? nextTracks[Math.floor(Math.random() * nextTracks.length)] : nextTracks[0]);
-      return;
-    }
-
-    if (target.kind === 'artist' && target.item) {
-      const artistAlbums = await plex.albums(libraryKey, target.item);
-      const albumTrackGroups = await Promise.all(artistAlbums.map((albumItem) => plex.tracks(libraryKey, albumItem).catch(() => [])));
-      const nextTracks = albumTrackGroups.flat();
-      if (!nextTracks.length) {
-        setStatus(`${target.item.title} has no playable tracks.`);
-        return;
-      }
-      setBrowseMode('artists');
-      setSelectedArtist(target.item);
-      setSelectedAlbum(null);
-      setSelectedPlaylist(null);
-      setSelectedTrack(null);
-      setAlbums(artistAlbums);
-      setTracks(nextTracks);
-      playQueue(nextTracks, shuffle ? nextTracks[Math.floor(Math.random() * nextTracks.length)] : nextTracks[0]);
-      return;
-    }
-
-    if (target.kind === 'album' && target.item) {
-      const nextTracks = target.tracks?.length ? target.tracks : await plex.tracks(libraryKey, target.item);
-      if (!nextTracks.length) {
-        setStatus(`${target.item.title} has no playable tracks.`);
-        return;
-      }
-      setSelectedAlbum(target.item);
-      setSelectedPlaylist(null);
-      setSelectedTrack(null);
-      setTracks(nextTracks);
-      playQueue(nextTracks, shuffle ? nextTracks[Math.floor(Math.random() * nextTracks.length)] : nextTracks[0]);
-    }
-  }
-
-  autoTransportRef.current = async (event = {}) => {
-    const action = event.action || '';
-    if (action === 'play') {
-      const localAudioPaused = audioRef.current?.paused !== false;
-      if ((!isPlaying && !castPlaying) || (!castPlaying && localAudioPaused)) await togglePlayback();
-      return;
-    }
-    if (action === 'pause') {
-      if (isPlaying || castPlaying) await togglePlayback();
-      return;
-    }
-    if (action === 'next') {
-      await nextTrack(false, true);
-      return;
-    }
-    if (action === 'previous') {
-      await previousTrack(true);
-      return;
-    }
-    if (action === 'seek') {
-      await seek(event.position || 0);
-      return;
-    }
-    if (action === 'playMediaId' && event.mediaId) {
-      await playAutoMediaId(event.mediaId);
-      return;
-    }
-    if (action === 'search' && event.query && plex) {
-      const results = await plex.search(event.query);
-      if (results.length) playQueue(results, results[0]);
-    }
-  };
-
-  useEffect(() => {
-    if (!window.moonbounce?.auto?.onTransport) return undefined;
-    return window.moonbounce.auto.onTransport((event) => {
-      autoTransportRef.current?.(event);
-    });
-  }, []);
-
-  useEffect(() => {
-    if (!window.moonbounce?.auto?.update) return;
-    window.moonbounce.auto.update({
-      title: currentTrack?.title || 'Nothing loaded',
-      artist: currentTrack?.grandparentTitle || currentTrack?.parentTitle || 'Music Complex',
-      album: currentTrack?.parentTitle || '',
-      coverUrl: currentTrack ? coverUrl(currentTrack) : '',
-      duration: duration || (currentTrack?.duration ? currentTrack.duration / 1000 : 0),
-      position: progress || 0,
-      playing: Boolean(isPlaying || castPlaying),
-    }).catch(() => {});
-  }, [currentTrack, progress, duration, isPlaying, castPlaying, connected, settings.serverUrl, settings.token]);
-
-  useEffect(() => {
-    if (!window.moonbounce?.auto?.catalog) return;
-    // Persist artists and their album index so head units can browse instantly. Songs and
-    // playlist pages remain dynamic to keep the bootstrap catalog compact.
-    const catalog = buildAndroidAutoCatalog({
-      artists,
-      playlists,
-      albums: autoLibraryAlbums,
-    });
-    const selectedAutoServer = plexServers.find((server) => server.id === settings.plexServerId)
-      || plexServers.find((server) => plexResourceUrls(server).includes(settings.serverUrl));
-    const autoServerUrls = selectedAutoServer
-      ? [
-        ...(selectedAutoServer.connections || [])
-          .filter((connection) => !connection.local && !connection.relay && connection.uri)
-          .map((connection) => connection.uri),
-        ...plexResourceUrls(selectedAutoServer),
-      ].filter((url, index, values) => url && values.indexOf(url) === index)
-      : (settings.plexServerUrls || [settings.serverUrl]);
-    window.moonbounce.auto.catalog({
-      ...attachPlayableUrlsToCatalog(catalog, [], playableUrl, (path) => coverUrl({ thumb: path })),
-      plex: {
-        serverUrl: settings.serverUrl,
-        serverUrls: autoServerUrls,
-        serverId: settings.plexServerId,
-        token: settings.token,
-        matchVolume,
-      },
-    }).catch(() => {});
-  }, [artists, playlists, autoLibraryAlbums, plexServers, settings.serverUrl, settings.plexServerId, settings.plexServerUrls, settings.token, matchVolume]);
 
   async function pollCastStatus({ alive = true, advanceQueue = false, fallbackOnFailure = false } = {}) {
       if (castStatusPollingRef.current) {
