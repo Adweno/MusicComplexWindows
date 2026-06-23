@@ -5,18 +5,16 @@ const os = require('os');
 const mdns = require('multicast-dns');
 const txt = require('dns-txt')();
 const loudness = require('loudness');
+const EventEmitter = require('events');
+const mime = require('mime');
 
-let ChromecastAPI;
-let ChromecastDevice;
-let DefaultMediaReceiver;
+let CastClient;
+let CastDefaultMediaReceiver;
 try {
-  ChromecastAPI = require('chromecast-api');
-  ChromecastDevice = require('chromecast-api/lib/device');
-  DefaultMediaReceiver = require('chromecast-api/apps/default/DefaultMediaReceiver');
+  ({ Client: CastClient, DefaultMediaReceiver: CastDefaultMediaReceiver } = require('castv2-client'));
 } catch (error) {
-  ChromecastAPI = null;
-  ChromecastDevice = null;
-  DefaultMediaReceiver = null;
+  CastClient = null;
+  CastDefaultMediaReceiver = null;
 }
 
 const isDev = !app.isPackaged;
@@ -31,10 +29,200 @@ const PLEX_HEADERS = {
   'X-Plex-Version': '1.0.0',
 };
 let mainWindow;
-let castClient;
 let playbackPowerBlockerId = null;
 const devices = new Map();
 let activeDevice = null;
+
+class MusicComplexMediaReceiver extends CastDefaultMediaReceiver {
+  load(resource, opts = {}, callback = () => {}) {
+    const media = typeof resource === 'string'
+      ? {
+          contentId: resource,
+          contentType: mime.getType(resource) || 'audio/mpeg',
+        }
+      : {
+          contentId: resource.url,
+          contentType: resource.contentType || mime.getType(resource.url) || 'audio/mpeg',
+          metadata: resource.cover ? {
+            type: 0,
+            metadataType: 0,
+            title: resource.cover.title,
+            images: [{ url: resource.cover.url }],
+          } : undefined,
+        };
+
+    CastDefaultMediaReceiver.prototype.load.call(this, media, {
+      autoplay: true,
+      currentTime: opts.startTime || 0,
+    }, callback);
+  }
+}
+
+class CastDevice extends EventEmitter {
+  constructor({ name, friendlyName, host }) {
+    super();
+    this.name = name;
+    this.friendlyName = friendlyName;
+    this.host = host;
+    this.client = null;
+    this.player = null;
+  }
+
+  _connect(callback) {
+    if (!CastClient) {
+      callback(new Error('Chromecast support is not available.'));
+      return;
+    }
+
+    if (this.client) this.client.close();
+    this.client = new CastClient();
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      callback(error || null);
+    };
+
+    this.client.on('error', (error) => {
+      try {
+        this.client?.close();
+      } catch {
+        // Ignore close errors from stale cast sockets.
+      }
+      this.client = null;
+      this.player = null;
+      finish(error);
+    });
+
+    this.client.connect(this.host, () => {
+      this.emit('connected');
+      finish(null);
+    });
+  }
+
+  _launch(appClass, callback) {
+    if (!this.client) {
+      callback(new Error('Cast device is not connected.'));
+      return;
+    }
+
+    this.client.getSessions((sessionError, sessions = []) => {
+      if (sessionError) {
+        callback(sessionError);
+        return;
+      }
+
+      const session = sessions.find((candidate) => candidate.appId === appClass.APP_ID);
+      if (session) this.client.join(session, appClass, callback);
+      else this.client.launch(appClass, callback);
+    });
+  }
+
+  _onLaunch(player) {
+    this.player = player;
+    this.player.on('status', (status) => {
+      this.emit('status', status);
+      if (status.playerState === 'IDLE' && status.idleReason === 'FINISHED') {
+        this.emit('finished');
+      }
+    });
+  }
+
+  _tryJoin(callback) {
+    if (this.client && this.player) {
+      callback(null);
+      return;
+    }
+
+    const connect = this.client ? (done) => done(null) : (done) => this._connect(done);
+    connect((connectError) => {
+      if (connectError) {
+        callback(connectError);
+        return;
+      }
+
+      this._launch(MusicComplexMediaReceiver, (launchError, player) => {
+        if (launchError) {
+          callback(launchError);
+          return;
+        }
+        this._onLaunch(player);
+        callback(null);
+      });
+    });
+  }
+
+  play(resource, opts, callback = () => {}) {
+    this._connect((connectError) => {
+      if (connectError) {
+        callback(connectError);
+        return;
+      }
+
+      this._launch(MusicComplexMediaReceiver, (launchError, player) => {
+        if (launchError) {
+          callback(launchError);
+          return;
+        }
+        this._onLaunch(player);
+        this.player.load(resource, opts || {}, callback);
+      });
+    });
+  }
+
+  getStatus(callback = () => {}) {
+    this._tryJoin((error) => {
+      if (error) callback(error);
+      else this.player.getStatus(callback);
+    });
+  }
+
+  getReceiverStatus(callback = () => {}) {
+    const connect = this.client ? (done) => done(null) : (done) => this._connect(done);
+    connect((error) => {
+      if (error) callback(error);
+      else this.client.getStatus(callback);
+    });
+  }
+
+  seekTo(seconds, callback = () => {}) {
+    this._tryJoin((error) => {
+      if (error) callback(error);
+      else this.player.seek(seconds, callback);
+    });
+  }
+
+  pause(callback = () => {}) {
+    this._tryJoin((error) => {
+      if (error) callback(error);
+      else this.player.pause(callback);
+    });
+  }
+
+  resume(callback = () => {}) {
+    this._tryJoin((error) => {
+      if (error) callback(error);
+      else this.player.play(callback);
+    });
+  }
+
+  setVolume(volume, callback = () => {}) {
+    this._tryJoin((error) => {
+      if (error) callback(error);
+      else this.client.setVolume({ level: volume }, callback);
+    });
+  }
+
+  stop(callback = () => {}) {
+    this._tryJoin((error) => {
+      if (error) {
+        callback(error);
+        return;
+      }
+      this.player.stop(callback);
+    });
+  }
+}
 
 function logFilePath() {
   return path.join(app.getPath('userData'), 'logs', 'music-complex.log');
@@ -287,19 +475,6 @@ function deviceSnapshot() {
   }));
 }
 
-function attachCastClient(client) {
-  client.on('device', (device) => {
-    rememberDevice(device);
-  });
-}
-
-function ensureCastClient() {
-  if (castClient || !ChromecastAPI) return;
-
-  castClient = new ChromecastAPI();
-  attachCastClient(castClient);
-}
-
 function decodeTxt(data) {
   const decoded = {};
   const chunks = Array.isArray(data) ? data : [data];
@@ -314,10 +489,10 @@ function decodeTxt(data) {
 }
 
 function rememberRawCastDevice(serviceName, raw) {
-  if (!ChromecastDevice || !raw.friendlyName || !raw.host) return;
+  if (!CastClient || !raw.friendlyName || !raw.host) return;
   if (devices.has(serviceName)) return;
 
-  const device = new ChromecastDevice({
+  const device = new CastDevice({
     name: serviceName,
     friendlyName: raw.friendlyName,
     host: raw.address || raw.host,
@@ -372,7 +547,7 @@ async function probeCastHttp(ip) {
 }
 
 async function runHttpSubnetCastScan() {
-  if (!ChromecastDevice) return;
+  if (!CastClient) return;
   const candidates = localSubnetCandidates();
   let index = 0;
   const found = [];
@@ -398,7 +573,7 @@ async function runHttpSubnetCastScan() {
 }
 
 function runRawMdnsScan(duration = 6500) {
-  if (!ChromecastDevice) return Promise.resolve();
+  if (!CastClient) return Promise.resolve();
 
   return new Promise((resolve) => {
     const browser = mdns();
@@ -461,22 +636,16 @@ function runRawMdnsScan(duration = 6500) {
 }
 
 async function restartCastScan() {
-  if (!ChromecastAPI) {
+  if (!CastClient) {
     return {
       supported: false,
       devices: [],
     };
   }
 
-  if (castClient?.destroy) {
-    castClient.destroy();
-  }
-  castClient = null;
   activeDevice = null;
   devices.clear();
   broadcast('cast:devices', []);
-  ensureCastClient();
-  if (castClient?.update) castClient.update();
   await Promise.all([
     runRawMdnsScan(),
     runHttpSubnetCastScan(),
@@ -493,7 +662,6 @@ app.whenReady().then(() => {
   playbackPowerBlockerId = powerSaveBlocker.start('prevent-app-suspension');
   writeLog('desktop-background-playback-enabled', { playbackPowerBlockerId });
   createWindow();
-  ensureCastClient();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -522,12 +690,10 @@ ipcMain.handle('log:path', () => logFilePath());
 
 ipcMain.handle('cast:list', () => {
   writeLog('cast:list', { devices: devices.size });
-  ensureCastClient();
-  if (castClient?.update) castClient.update();
   runRawMdnsScan(2500);
   runHttpSubnetCastScan();
   return {
-    supported: Boolean(ChromecastAPI),
+    supported: Boolean(CastClient),
     devices: deviceSnapshot(),
   };
 });
@@ -546,7 +712,6 @@ function findCastDevice(payload = {}) {
 
 ipcMain.handle('cast:connect', async (_event, payload) => {
   writeLog('cast:connect:start', payload);
-  ensureCastClient();
   const device = findCastDevice(payload);
 
   if (!device) {
@@ -571,7 +736,7 @@ ipcMain.handle('cast:connect', async (_event, payload) => {
       reject(new Error(`Timed out connecting to ${device.friendlyName || device.name}`));
     }, 10000);
 
-    if (DefaultMediaReceiver && typeof device._connect === 'function' && typeof device._launch === 'function') {
+    if (CastDefaultMediaReceiver && typeof device._connect === 'function' && typeof device._launch === 'function') {
       device._connect((connectError) => {
         if (connectError) {
           clearTimeout(timeout);
@@ -579,7 +744,7 @@ ipcMain.handle('cast:connect', async (_event, payload) => {
           return;
         }
 
-        device._launch(DefaultMediaReceiver, (launchError, player) => {
+        device._launch(MusicComplexMediaReceiver, (launchError, player) => {
           clearTimeout(timeout);
           if (launchError) {
             reject(launchError);
@@ -609,7 +774,6 @@ ipcMain.handle('cast:play', async (_event, payload) => {
     device: payload.id || payload.host,
     startTime: payload.startTime || 0,
   });
-  ensureCastClient();
   const device = findCastDevice(payload) || activeDevice;
 
   if (!device) {
